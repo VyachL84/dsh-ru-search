@@ -39,3 +39,10 @@ test('MCP: initialize и tools/list по stdio', async () => {
   const names = lines[1].result.tools.map((t) => t.name).sort();
   assert.deepStrictEqual(names, ['web_open', 'yandex_fetch', 'yandex_search']);
 });
+
+test('SSRF: внутренние адреса блокируются', async () => {
+  for (const ip of ['127.0.0.1', '10.0.0.1', '169.254.169.254', '192.168.1.1', '100.64.0.1', '::1', '::ffff:7f00:1', 'fd00::1']) assert.ok(lib.isPrivateIp(ip), ip);
+  for (const ip of ['8.8.8.8', '77.88.8.8']) assert.ok(!lib.isPrivateIp(ip), ip);
+  for (const u of ['http://127.0.0.1:8787/', 'http://169.254.169.254/latest/', 'http://svc.ns.svc.cluster.local/', 'http://localhost/'])
+    await assert.rejects(lib.get(u), /заблокирован/, u);
+});

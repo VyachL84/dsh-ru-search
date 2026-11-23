@@ -17,6 +17,8 @@ const fs = require('fs');
 const path = require('path');
 
 const os = require('os');
+const dns = require('dns');
+const net = require('net');
 const CERT_DIR = process.env.YA_CERT_DIR || path.join(os.homedir(), '.dsh-ru-search', 'certs');
 const YB_VER = process.env.YA_BROWSER_VERSION || '25.8.0.0';
 const CH_VER = process.env.YA_CHROMIUM_VERSION || '138';
@@ -36,8 +38,51 @@ function loadCa() {
   } catch (_) { /* каталога нет — работаем только с системными корнями */ }
   return { ca: [...tls.rootCertificates, ...extra], extraCount: extra.length };
 }
+// ---------- защита от SSRF ----------
+// Агент (или инструкция из загруженной страницы) не должен ходить на внутренние адреса: сервисы кластера,
+// метаданные облака, loopback. Проверяются и IP в URL, и результат DNS-разрешения в момент соединения
+// (защита от DNS rebinding), для каждого редиректа и для докачки сертификатов AIA.
+// YA_ALLOW_PRIVATE=1 отключает защиту; YA_ALLOW_HOSTS="host1,host2" — исключения по имени хоста.
+const ALLOW_PRIVATE = process.env.YA_ALLOW_PRIVATE === '1';
+const ALLOW_HOSTS = (process.env.YA_ALLOW_HOSTS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
+function v4Private(a) {
+  const [o1, o2, o3] = a.split('.').map(Number);
+  return o1 === 0 || o1 === 10 || o1 === 127 || o1 >= 224 ||
+    (o1 === 100 && o2 >= 64 && o2 <= 127) || (o1 === 169 && o2 === 254) ||
+    (o1 === 172 && o2 >= 16 && o2 <= 31) || (o1 === 192 && o2 === 168) ||
+    (o1 === 192 && o2 === 0 && o3 === 0) || (o1 === 198 && (o2 === 18 || o2 === 19));
+}
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) return v4Private(ip);
+  const x = ip.toLowerCase();
+  const m = /^(?:::ffff:|64:ff9b::)(\d+\.\d+\.\d+\.\d+)$/.exec(x);   // IPv4-mapped / NAT64
+  if (m) return v4Private(m[1]);
+  const mh = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(x);
+  if (mh) { const h = parseInt(mh[1], 16), l = parseInt(mh[2], 16); return v4Private(`${h >> 8}.${h & 255}.${l >> 8}.${l & 255}`); }
+  return x === '::' || x === '::1' || /^f[cd]/.test(x) || /^fe[89ab]/.test(x) || /^ff/.test(x);
+}
+const blockedMsg = (h, ip) => new Error(`Доступ к внутренним адресам заблокирован (${h}${ip && ip !== h ? ' → ' + ip : ''}). Плагин ходит только на публичные сайты.`);
+function checkHostLiteral(host) {
+  const h = host.replace(/^\[|\]$/g, '').toLowerCase();
+  if (ALLOW_PRIVATE || ALLOW_HOSTS.includes(h)) return;
+  if (net.isIP(h) && isPrivateIp(h)) throw blockedMsg(h);
+  if (h === 'localhost' || /\.(local|localhost|internal|cluster\.local|svc)$/.test(h)) throw blockedMsg(h);
+}
+function guardedLookup(hostname, opts, cb) {
+  if (typeof opts === 'function') { cb = opts; opts = {}; }
+  dns.lookup(hostname, { ...opts, all: true }, (err, addrs) => {
+    if (err) return cb(err);
+    if (!ALLOW_PRIVATE && !ALLOW_HOSTS.includes(hostname.toLowerCase())) {
+      const bad = addrs.find((a) => isPrivateIp(a.address));
+      if (bad) return cb(blockedMsg(hostname, bad.address));
+    }
+    if (opts && opts.all) return cb(null, addrs);
+    cb(null, addrs[0].address, addrs[0].family);
+  });
+}
+
 let { ca: CA, extraCount } = loadCa();
-let agent = new https.Agent({ ca: CA, keepAlive: true, maxSockets: 4 });
+let agent = new https.Agent({ ca: CA, keepAlive: true, maxSockets: 4, lookup: guardedLookup });
 
 // ---------- AIA: докачка недостающих промежуточных сертификатов ----------
 // Часть сайтов (например np-sr.ru) не отдаёт промежуточный сертификат; браузеры докачивают его по
@@ -55,7 +100,8 @@ function plainGet(u, hops = 3) {
   return new Promise((resolve, reject) => {
     const url = new URL(u);
     if (!/^https?:$/.test(url.protocol)) return reject(new Error('AIA: схема'));
-    (url.protocol === 'https:' ? https : http).get(url, { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+  try { checkHostLiteral(url.hostname); } catch (e) { return reject(e); }
+      (url.protocol === 'https:' ? https : http).get(url, { timeout: 10000, lookup: guardedLookup, headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && hops > 0) { res.resume(); return plainGet(new URL(res.headers.location, url).toString(), hops - 1).then(resolve, reject); }
       const ch = []; let n = 0;
       res.on('data', (c) => { n += c.length; if (n > 100000) res.destroy(new Error('AIA: слишком большой ответ')); else ch.push(c); });
@@ -66,7 +112,8 @@ function plainGet(u, hops = 3) {
 }
 function peerChain(host, port) {
   return new Promise((resolve, reject) => {
-    const sock = tls.connect({ host, port, servername: host, rejectUnauthorized: false, timeout: 10000 }, () => {
+  try { checkHostLiteral(host); } catch (e) { return reject(e); }
+      const sock = tls.connect({ host, port, servername: host, rejectUnauthorized: false, timeout: 10000, lookup: guardedLookup }, () => {
       const out = []; let c = sock.getPeerCertificate(true);
       for (let i = 0; c && c.raw && i < 6; i++) { out.push(c.raw); if (!c.issuerCertificate || c.issuerCertificate === c) break; c = c.issuerCertificate; }
       sock.end(); resolve(out);
@@ -118,9 +165,9 @@ async function ensureCerts() {
   ({ ca: CA, extraCount } = loadCa()); rootObjs = null; rebuildAgent();
   process.stderr.write(`[dsh-ru-search] корни Минцифры сохранены в ${CERT_DIR}\n`);
 }
-function rebuildAgent() { agent = new https.Agent({ ca: [...CA, ...aiaAccepted.values()], keepAlive: true, maxSockets: 4 }); }
+function rebuildAgent() { agent = new https.Agent({ ca: [...CA, ...aiaAccepted.values()], keepAlive: true, maxSockets: 4, lookup: guardedLookup }); }
 // только по явному запросу (insecure:true): сайт без валидного сертификата (просрочен, заглушка хостинга)
-const agentInsecure = new https.Agent({ rejectUnauthorized: false, keepAlive: true, maxSockets: 2 });
+const agentInsecure = new https.Agent({ rejectUnauthorized: false, keepAlive: true, maxSockets: 2, lookup: guardedLookup });
 
 // ---------- HTTP как Яндекс.Браузер ----------
 const jar = new Map(); // host -> Map(name -> value)
@@ -171,7 +218,8 @@ function get(urlStr, { referer = 'https://yandex.ru/', hops = 6, insecure = fals
     if (url.hostname.endsWith('.')) url.hostname = url.hostname.replace(/\.+$/, '');
     if (!/^https?:$/.test(url.protocol)) return reject(new Error('Разрешены только http/https'));
     const lib = url.protocol === 'https:' ? https : http;
-    const req = lib.request(url, { method: 'GET', headers: browserHeaders(url, referer), agent: url.protocol === 'https:' ? (insecure ? agentInsecure : agent) : undefined, timeout: TIMEOUT_MS }, (res) => {
+  try { checkHostLiteral(url.hostname); } catch (e) { return reject(e); }
+      const req = lib.request(url, { method: 'GET', headers: browserHeaders(url, referer), agent: url.protocol === 'https:' ? (insecure ? agentInsecure : agent) : undefined, lookup: guardedLookup, timeout: TIMEOUT_MS }, (res) => {
       storeCookies(url.hostname, res.headers['set-cookie']);
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -337,7 +385,7 @@ async function handle(msg) {
   const fail = (code, message) => id !== undefined && send({ jsonrpc: '2.0', id, error: { code, message } });
   try {
     if (method === 'initialize') {
-      return reply({ protocolVersion: (params && params.protocolVersion) || '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'dsh-ru-search', version: '1.0.0' } });
+      return reply({ protocolVersion: (params && params.protocolVersion) || '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'dsh-ru-search', version: '1.0.1' } });
     }
     if (method === 'ping') return reply({});
     if (method === 'tools/list') return reply({ tools: TOOLS.map(({ run, ...t }) => t) });
@@ -371,5 +419,5 @@ if (require.main === module) {
   });
   process.stdin.on('end', () => { ended = true; if (!pending) process.exit(0); });
 } else {
-  module.exports = { parseSerp, htmlToText, isCaptcha, get, ensureCerts, loadCa };
+  module.exports = { parseSerp, htmlToText, isCaptcha, get, ensureCerts, loadCa, isPrivateIp };
 }
