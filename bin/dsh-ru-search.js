@@ -165,7 +165,8 @@ async function ensureCerts() {
   ({ ca: CA, extraCount } = loadCa()); rootObjs = null; rebuildAgent();
   process.stderr.write(`[dsh-ru-search] корни Минцифры сохранены в ${CERT_DIR}\n`);
 }
-function rebuildAgent() { agent = new https.Agent({ ca: [...CA, ...aiaAccepted.values()], keepAlive: true, maxSockets: 4, lookup: guardedLookup }); }
+let agentVer = 0;   // растет при каждой пересборке: параллельный запрос, упавший до докачки сертификатов, повторяется без новой докачки
+function rebuildAgent() { agentVer++; agent = new https.Agent({ ca: [...CA, ...aiaAccepted.values()], keepAlive: true, maxSockets: 4, lookup: guardedLookup }); }
 // только по явному запросу (insecure:true): сайт без валидного сертификата (просрочен, заглушка хостинга)
 const agentInsecure = new https.Agent({ rejectUnauthorized: false, keepAlive: true, maxSockets: 2, lookup: guardedLookup });
 
@@ -211,6 +212,7 @@ function browserHeaders(url, referer) {
 
 function get(urlStr, { referer = 'https://yandex.ru/', hops = 6, insecure = false, aiaTried = false } = {}) {
   return new Promise((resolve, reject) => {
+    const verAtStart = agentVer;
     let url;
     try { url = new URL(urlStr); } catch (e) { return reject(new Error('Некорректный URL: ' + urlStr)); }
     // «example.ru.» (точка на конце) уходит в SNI как есть, и многие виртуальные хосты
@@ -233,14 +235,15 @@ function get(urlStr, { referer = 'https://yandex.ru/', hops = 6, insecure = fals
       else if (enc === 'br') stream = res.pipe(zlib.createBrotliDecompress());
       else if (enc === 'deflate') stream = res.pipe(zlib.createInflate());
       const chunks = []; let size = 0;
-      stream.on('data', (c) => { size += c.length; if (size > MAX_BYTES) { req.destroy(new Error('Ответ больше 3 МБ')); } else chunks.push(c); });
+      const isDoc = DOC_CT.test(res.headers['content-type'] || '') || DOC_EXT.test(url.pathname);
+      stream.on('data', (c) => { size += c.length; if (size > (isDoc ? MAX_DOC_BYTES : MAX_BYTES)) { req.destroy(new Error(`Ответ больше ${isDoc ? MAX_DOC_BYTES >> 20 : MAX_BYTES >> 20} МБ`)); } else chunks.push(c); });
       stream.on('end', () => {
         const ct = res.headers['content-type'] || '';
         const m = /charset=([\w-]+)/i.exec(ct);
         let body;
         try { body = new TextDecoder((m && m[1]) || 'utf-8').decode(Buffer.concat(chunks)); }
         catch (_) { body = Buffer.concat(chunks).toString('utf8'); }
-        resolve({ status: res.statusCode, url: url.toString(), contentType: ct, body });
+        resolve({ status: res.statusCode, url: url.toString(), contentType: ct, body, raw: isDoc ? Buffer.concat(chunks) : null });
       });
       stream.on('error', reject);
     });
@@ -248,8 +251,10 @@ function get(urlStr, { referer = 'https://yandex.ru/', hops = 6, insecure = fals
     req.on('error', (err) => {
       // сервер не прислал промежуточный сертификат — достраиваем цепочку по AIA и повторяем один раз
       if (!insecure && !aiaTried && url.protocol === 'https:' && /UNABLE_TO_VERIFY_LEAF_SIGNATURE/.test(err.code || '')) {
+        const retry = () => get(urlStr, { referer, hops, insecure, aiaTried: true }).then(resolve, reject);
+        if (agentVer !== verAtStart) return retry();   // сертификаты уже докачал параллельный запрос
         fetchIntermediates(url.hostname, Number(url.port) || 443).then((ok) => {
-          if (!ok) return reject(err);
+          if (!ok) return agentVer !== verAtStart ? retry() : reject(err);
           rebuildAgent();
           get(urlStr, { referer, hops, insecure, aiaTried: true }).then(resolve, reject);
         }, () => reject(err));
@@ -257,6 +262,57 @@ function get(urlStr, { referer = 'https://yandex.ru/', hops = 6, insecure = fals
     });
     req.end();
   });
+}
+
+// ---------- документы (PDF, DOCX) -> текст ----------
+// Регламенты ОРЭМ публикуются в PDF/DOCX. Текст извлекает Python (pypdf для PDF; DOCX - стандартная библиотека),
+// результат кэшируется в DOC_CACHE, чтобы повторные обращения (offset/find) не конвертировали файл заново.
+const DOC_CT = /application\/pdf|officedocument\.wordprocessingml/i;
+const DOC_EXT = /\.(pdf|docx)$/i;
+const MAX_DOC_BYTES = 60 * 1048576;
+const PY = process.env.YA_PYTHON || 'python3';
+const DOC_CACHE = process.env.YA_DOC_CACHE || path.join(os.tmpdir(), 'yandex-docs');
+const PY_PDF = `import sys, io
+from pypdf import PdfReader
+r = PdfReader(io.BytesIO(sys.stdin.buffer.read()))
+out = []
+for i, p in enumerate(r.pages, 1):
+    try: t = p.extract_text() or ''
+    except Exception: t = ''
+    out.append('\\n=== стр. %d ===\\n%s' % (i, t))
+sys.stdout.buffer.write(''.join(out).encode('utf-8'))`;
+const PY_DOCX = `import sys, io, re, zipfile, html
+z = zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read()))
+x = z.read('word/document.xml').decode('utf-8')
+x = re.sub(r'</w:p>', '\\n', x); x = re.sub(r'</w:tc>', ' | ', x); x = re.sub(r'<w:tab/>', '\\t', x); x = re.sub(r'<w:br/>', '\\n', x)
+x = html.unescape(re.sub(r'<[^>]+>', '', x))
+sys.stdout.buffer.write(re.sub(r'\\n{3,}', '\\n\\n', x).encode('utf-8'))`;
+function docKind(res) {
+  const raw = res.raw; if (!raw || !raw.length) return null;
+  if (raw.slice(0, 4).toString('latin1') === '%PDF') return 'pdf';
+  if (raw.slice(0, 2).toString('latin1') === 'PK' && (/wordprocessingml/i.test(res.contentType) || /\.docx$/i.test(new URL(res.url).pathname))) return 'docx';
+  return null;
+}
+async function docText(res, kind) {
+  fs.mkdirSync(DOC_CACHE, { recursive: true });
+  const f = path.join(DOC_CACHE, require('crypto').createHash('sha1').update(res.url).update(String(res.raw.length)).digest('hex') + '.txt');
+  try { return fs.readFileSync(f, 'utf8'); } catch (_) {}
+  const text = await new Promise((resolve, reject) => {
+    const cp = require('child_process').spawn(PY, ['-c', kind === 'pdf' ? PY_PDF : PY_DOCX], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const out = []; let err = '';
+    const timer = setTimeout(() => { cp.kill('SIGKILL'); reject(new Error('Конвертация документа заняла больше 3 минут')); }, 180000);
+    cp.stdout.on('data', (d) => out.push(d)); cp.stderr.on('data', (d) => { err += d; });
+    cp.on('error', (e) => { clearTimeout(timer); reject(new Error(`Не удалось запустить ${PY} для чтения документа: ${e.message}`)); });
+    cp.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(/No module named 'pypdf'/.test(err) ? 'Для чтения PDF нужен пакет pypdf (pip install pypdf)' : 'Не удалось извлечь текст документа: ' + err.slice(-300)));
+      resolve(Buffer.concat(out).toString('utf8'));
+    });
+    cp.stdin.on('error', () => {}); cp.stdin.end(res.raw);
+  });
+  if (kind === 'pdf' && text.replace(/=== стр\. \d+ ===|\s/g, '').length < 50) throw new Error('В PDF нет текстового слоя (скан); текст извлечь нельзя');
+  try { fs.writeFileSync(f, text); } catch (_) {}
+  return text;
 }
 
 // ---------- разбор HTML ----------
@@ -323,7 +379,7 @@ async function yandexSearch({ query, page = 1, region, site, count = 10 }) {
   return items.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join('\n\n');
 }
 
-async function fetchPage({ url, max_chars = 20000, referer, insecure = false, links = false }) {
+async function fetchPage({ url, max_chars = 20000, offset = 0, find, context = 300, referer, insecure = false, links = false, links_filter, max_links = 100 }) {
   let res;
   try { res = await get(url, { referer: referer || 'https://yandex.ru/', insecure: !!insecure }); }
   catch (e) {
@@ -332,34 +388,61 @@ async function fetchPage({ url, max_chars = 20000, referer, insecure = false, li
     throw e;
   }
   if (res.status >= 400) throw new Error(`HTTP ${res.status} для ${res.url}`);
-  if (/application\/pdf|image\/|audio\/|video\/|octet-stream/i.test(res.contentType)) throw new Error('Не текстовый контент: ' + res.contentType);
-  const { title, text } = /html|xml/i.test(res.contentType) || /<html/i.test(res.body.slice(0, 500)) ? htmlToText(res.body) : { title: '', text: res.body };
+  const kind = docKind(res);
+  let title = '', text;
+  if (kind) { text = await docText(res, kind); title = `${kind.toUpperCase()}-документ`; }
+  else if (/application\/pdf|image\/|audio\/|video\/|octet-stream|officedocument|msword|ms-excel/i.test(res.contentType)) throw new Error('Не текстовый контент: ' + res.contentType + (/pdf|word/i.test(res.contentType) ? ' (читаются PDF и DOCX; старый .doc не поддерживается)' : ''));
+  else ({ title, text } = /html|xml/i.test(res.contentType) || /<html/i.test(res.body.slice(0, 500)) ? htmlToText(res.body) : { title: '', text: res.body });
   const lim = Math.max(500, Math.min(max_chars, 100000));
   let linkList = '';
   if (links && /html/i.test(res.contentType)) {
-    const seen = new Set(); const out = [];
+    const seen = new Set(); const out = []; let flt = null;
+    if (links_filter) { try { flt = new RegExp(links_filter, 'i'); } catch (e) { throw new Error('links_filter: некорректное регулярное выражение'); } }
+    const cap = Math.max(1, Math.min(+max_links || 100, 1000));
     for (const m of res.body.matchAll(/<a\s[^>]*href="([^"#][^"]*)"[^>]*>([\s\S]*?)<\/a>/gi)) {
       let u; try { u = new URL(decode(m[1]), res.url).toString(); } catch { continue; }
       if (!/^https?:/.test(u) || seen.has(u)) continue; seen.add(u);
-      out.push(`- ${strip(m[2]).slice(0, 80) || '(без текста)'} → ${u}`);
-      if (out.length >= 100) break;
+      const label = strip(m[2]).slice(0, 80);
+      if (flt && !flt.test(label + ' ' + u)) continue;
+      out.push(`- ${label || '(без текста)'} → ${u}`);
+      if (out.length >= cap) break;
     }
     if (out.length) linkList = '\n\nСсылки:\n' + out.join('\n');
   }
-  return `${insecure ? '⚠ ПРОВЕРКА СЕРТИФИКАТА ОТКЛЮЧЕНА (insecure:true)\n' : ''}URL: ${res.url}\nTitle: ${title}\n\n${text.slice(0, lim)}${text.length > lim ? '\n…[обрезано]' : ''}${linkList}`;
+  const head = `${insecure ? '⚠ ПРОВЕРКА СЕРТИФИКАТА ОТКЛЮЧЕНА (insecure:true)\n' : ''}URL: ${res.url}\nTitle: ${title}\nВсего символов: ${text.length}\n\n`;
+  if (find) {   // поиск по тексту: фрагменты вокруг совпадений (с номерами страниц для PDF), экономит контекст на больших документах
+    // пробел в шаблоне = любые пробелы и переводы строк (в PDF слова часто переносятся)
+    let re; try { re = new RegExp(find.replace(/ +/g, '\\s+'), 'gi'); } catch (e) { throw new Error('find: некорректное регулярное выражение'); }
+    const ctx = Math.max(50, Math.min(+context || 300, 2000)), hits = []; let m, total = 0;
+    while ((m = re.exec(text))) {
+      total++; if (m[0] === '') re.lastIndex++;
+      if (hits.length < 15) {
+        const pg = [...text.slice(0, m.index).matchAll(/=== стр\. (\d+) ===/g)].pop();
+        hits.push(`[#${hits.length + 1} позиция ${m.index}${pg ? ', стр. ' + pg[1] : ''}]\n…${text.slice(Math.max(0, m.index - ctx), m.index + m[0].length + ctx).replace(/\n{2,}/g, '\n')}…`);
+      }
+    }
+    return head + (total ? `Совпадений: ${total}${total > 15 ? ' (показаны первые 15; уточните find)' : ''}\n\n${hits.join('\n\n')}` : 'Совпадений нет') + linkList;
+  }
+  const off = Math.max(0, +offset || 0), end = off + lim;
+  return head + `${text.slice(off, end)}${text.length > end ? `\n…[обрезано; продолжение: offset=${end}]` : ''}${linkList}`;
 }
 
 const FETCH_SCHEMA = { type: 'object', properties: {
   url: { type: 'string', description: 'http(s) URL' },
   max_chars: { type: 'integer', description: 'Максимум символов текста (500–100000, по умолчанию 20000)' },
+  offset: { type: 'integer', description: 'С какого символа текста продолжить (для длинных страниц и документов; значение указано в конце предыдущего ответа)' },
+  find: { type: 'string', description: 'Регулярное выражение (без учета регистра): вместо текста вернуть до 15 фрагментов вокруг совпадений с позицией и номером страницы PDF. Лучший способ искать пункт в большом регламенте' },
+  context: { type: 'integer', description: 'Символов контекста вокруг совпадения для find (50–2000, по умолчанию 300)' },
   links: { type: 'boolean', description: 'Добавить список ссылок страницы (для навигации по сайту)' },
+  links_filter: { type: 'string', description: 'Регулярное выражение (без учета регистра): оставить только ссылки, у которых текст или адрес подходит. Нужен на сайтах с огромным меню, где первые 100 ссылок - навигация' },
+  max_links: { type: 'integer', description: 'Сколько ссылок вернуть (по умолчанию 100, максимум 1000)' },
   referer: { type: 'string', description: 'Referer (по умолчанию https://yandex.ru/ — «переход из Яндекс.Браузера»)' },
   insecure: { type: 'boolean', description: 'Не проверять сертификат сервера (только если у сайта сломан сертификат и пользователь согласен на риск)' } }, required: ['url'] };
 
 const TOOLS = [
   {
     name: 'web_open',
-    description: 'Открыть любой сайт как Яндекс.Браузер с корнями Минцифры (Russian Trusted Root/Sub CA): работает на сайтах, которые требуют такой браузер/сертификат и на которых обычный web fetch падает с ошибкой сертификата. Возвращает текст страницы; links:true добавляет ссылки для перехода дальше. Cookie сохраняются между вызовами.',
+    description: 'Открыть любой сайт как Яндекс.Браузер с корнями Минцифры (Russian Trusted Root/Sub CA): работает на сайтах, которые требуют такой браузер/сертификат и на которых обычный web fetch падает с ошибкой сертификата. Читает HTML, PDF и DOCX (регламенты, НПА) как текст; links:true добавляет ссылки для перехода дальше, find ищет по тексту, offset листает. Cookie сохраняются между вызовами.',
     inputSchema: FETCH_SCHEMA,
     run: fetchPage,
   },
@@ -385,7 +468,7 @@ async function handle(msg) {
   const fail = (code, message) => id !== undefined && send({ jsonrpc: '2.0', id, error: { code, message } });
   try {
     if (method === 'initialize') {
-      return reply({ protocolVersion: (params && params.protocolVersion) || '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'dsh-ru-search', version: '1.0.1' } });
+      return reply({ protocolVersion: (params && params.protocolVersion) || '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'dsh-ru-search', version: '1.1.0' } });
     }
     if (method === 'ping') return reply({});
     if (method === 'tools/list') return reply({ tools: TOOLS.map(({ run, ...t }) => t) });
