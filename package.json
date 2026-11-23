@@ -1,0 +1,15 @@
+{
+  "name": "dsh-ru-search",
+  "version": "1.0.0",
+  "description": "MCP-сервер для DeepSeek Harness (dsh): поиск Яндекса без API и открытие сайтов с сертификатами Минцифры",
+  "license": "MIT",
+  "author": "VyachL84",
+  "repository": { "type": "git", "url": "git+https://github.com/VyachL84/dsh-ru-search.git" },
+  "homepage": "https://github.com/VyachL84/dsh-ru-search#readme",
+  "bugs": { "url": "https://github.com/VyachL84/dsh-ru-search/issues" },
+  "keywords": ["mcp", "dsh", "deepseek", "yandex", "search", "russian-trusted-ca", "mincifry"],
+  "bin": { "dsh-ru-search": "bin/dsh-ru-search.js" },
+  "files": ["bin", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test test/basic.test.js" }
+}
