@@ -85,7 +85,7 @@ let { ca: CA, extraCount } = loadCa();
 let agent = new https.Agent({ ca: CA, keepAlive: true, maxSockets: 4, lookup: guardedLookup });
 
 // ---------- AIA: докачка недостающих промежуточных сертификатов ----------
-// Часть сайтов (например np-sr.ru) не отдаёт промежуточный сертификат; браузеры докачивают его по
+// Часть сайтов не отдаёт промежуточный сертификат; браузеры докачивают его по
 // ссылке «CA Issuers» из сертификата. Докачанный сертификат принимается ТОЛЬКО если он подписан
 // доверенным корнем или уже принятым промежуточным (иначе подмена AIA дала бы доверенный сертификат).
 const { X509Certificate } = require('crypto');
@@ -265,7 +265,7 @@ function get(urlStr, { referer = 'https://yandex.ru/', hops = 6, insecure = fals
 }
 
 // ---------- документы (PDF, DOCX) -> текст ----------
-// Регламенты ОРЭМ публикуются в PDF/DOCX. Текст извлекает Python (pypdf для PDF; DOCX - стандартная библиотека),
+// Документы и регламенты часто публикуются в PDF/DOCX. Текст извлекает Python (pypdf для PDF; DOCX - стандартная библиотека),
 // результат кэшируется в DOC_CACHE, чтобы повторные обращения (offset/find) не конвертировали файл заново.
 const DOC_CT = /application\/pdf|officedocument\.wordprocessingml/i;
 const DOC_EXT = /\.(pdf|docx)$/i;
